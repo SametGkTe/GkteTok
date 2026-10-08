@@ -1,0 +1,126 @@
+package com.golda.patchertiktok;
+
+import android.graphics.Typeface;
+import android.widget.TextView;
+
+import java.io.File;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * GkteTok — kendi yazı tipin.
+ *
+ * Kullanıcının seçtiği .ttf dosyası TikTok'un veri klasörüne kopyalanır ve
+ * {@link TextView#setTypeface} kancasında **sistem varsayılanı olan** yazı tipleri
+ * yerine bu yazı tipi kurulur.
+ *
+ * Neden aile kontrolü var?
+ *   TikTok ikonları özel ikon yazı tipleriyle çiziyor (ör. "IconFont"). Onları da
+ *   değiştirseydik ikonlar bozulurdu. Bu yüzden yalnızca ailesi boş, "sans-serif",
+ *   "roboto" gibi **sistem** aileleri olan yazı tipleri değiştirilir; marka/ikon
+ *   yazı tiplerine dokunulmaz.
+ *
+ * Kalınlık (bold/italic) korunur: seçilen yazı tipinden istenen stille türetilir ve
+ * stil başına önbelleğe alınır.
+ */
+final class FontOverride {
+    private static final Map<Integer, Typeface> STYLED = new ConcurrentHashMap<>();
+    private static volatile String loadedPath;
+    private static volatile Typeface loaded;
+
+    private FontOverride() { }
+
+    static void install() {
+        try {
+            Hooks.hookAll(TextView.class, "setTypeface", new Hooks.Hook() {
+                @Override protected void before(Hooks.Call call) {
+                    if (!Prefs.on(Prefs.FONT)) return;
+                    Typeface base = custom(Prefs.fontPath());
+                    if (base == null) return;
+                    if (call.args.length == 0 || !(call.args[0] instanceof Typeface)) return;
+                    if (!replaceable((Typeface) call.args[0])) return;
+                    int style = call.args.length > 1 && call.args[1] instanceof Integer
+                            ? ((Integer) call.args[1]) & (Typeface.BOLD | Typeface.ITALIC)
+                            : Typeface.NORMAL;
+                    call.args[0] = styled(base, style);
+                }
+            });
+            RuntimeLog.log("font: hooks installed" + (Prefs.fontPath().isEmpty() ? "" : " (" + name(Prefs.fontPath()) + ")"));
+        } catch (Throwable error) {
+            RuntimeLog.log("font: cannot install: " + error);
+        }
+    }
+
+    /** Yalnızca sistem aileleri değiştirilir; ikon/marka yazı tipleri korunur. */
+    static boolean replaceable(Typeface original) {
+        if (original == null) return true;
+        String family = family(original);
+        if (family == null) {
+            // Aile adı okunamadı (gizli API engeli): yalnızca bilinen sistem nesnelerine dokun.
+            return original == Typeface.DEFAULT || original == Typeface.DEFAULT_BOLD
+                    || original == Typeface.SANS_SERIF || original == Typeface.SERIF
+                    || original == Typeface.MONOSPACE;
+        }
+        String value = family.toLowerCase(Locale.ROOT);
+        if (value.contains("sans-serif") || value.contains("system-ui")) return true;
+        return value.equals("roboto") || value.equals("default") || value.equals("normal");
+    }
+
+    /**
+     * Aile adı SDK'da açık değildir (getFamilyName/getFamily gizli API); yansıma ile okunur.
+     * Okunamazsa null döner ve karar muhafazakâr kalır — ikon yazı tiplerini bozmamak önceliğimiz.
+     */
+    private static String family(Typeface typeface) {
+        for (String name : new String[]{"getFamilyName", "getFamily"}) {
+            try {
+                java.lang.reflect.Method method = Typeface.class.getDeclaredMethod(name);
+                method.setAccessible(true);
+                Object value = method.invoke(typeface);
+                if (value instanceof String) return (String) value;
+            } catch (Throwable ignored) {
+                // Sıradaki adı dene.
+            }
+        }
+        if (!familyLogged) {
+            familyLogged = true;
+            RuntimeLog.log("font: family lookup unavailable, only system typefaces are replaced");
+        }
+        return null;
+    }
+
+    private static volatile boolean familyLogged;
+
+    private static Typeface custom(String path) {
+        if (path == null || path.isEmpty()) return null;
+        Typeface current = loaded;
+        if (current != null && path.equals(loadedPath)) return current;
+        synchronized (FontOverride.class) {
+            if (path.equals(loadedPath) && loaded != null) return loaded;
+            Typeface created = null;
+            try {
+                File file = new File(path);
+                if (file.isFile()) created = Typeface.createFromFile(file);
+            } catch (Throwable error) {
+                RuntimeLog.log("font: cannot read " + name(path) + ": " + error);
+            }
+            loadedPath = path;
+            loaded = created;
+            STYLED.clear();
+            return created;
+        }
+    }
+
+    private static Typeface styled(Typeface base, int style) {
+        Typeface cached = STYLED.get(style);
+        if (cached != null) return cached;
+        Typeface created = Typeface.create(base, style);
+        STYLED.put(style, created);
+        return created;
+    }
+
+    private static String name(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash < 0 ? path : path.substring(slash + 1);
+    }
+}

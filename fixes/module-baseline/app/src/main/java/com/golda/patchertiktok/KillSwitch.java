@@ -1,0 +1,588 @@
+package com.golda.patchertiktok;
+
+import android.app.Activity;
+import android.app.Application;
+import android.app.Instrumentation;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
+import android.content.res.Configuration;
+import android.graphics.drawable.Icon;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.lang.annotation.Annotation;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * GkteTok — Acil gizleme (Kill Switch).
+ *
+ * Açıkken iki şey olur, ikisi de yalnızca ekranda:
+ *   1. Mesaj (DM) ekranlarının üstüne boş bir perde iner. Mesajlar silinmez, değişmez,
+ *      hiçbir yere gönderilmez — sadece o ekran görünmez olur, başka ekrana geçince kalkar.
+ *   2. Profildeki beğeni sayısı 0 gösterilir (bulunabilirse veri kancasıyla; kurulup
+ *      kurulmadığı "Sağlık" ekranında ve günlükte yazar).
+ *
+ * Açma yolu: ana ekranda TikTok simgesine uzun bas → "Kill Switch". Kapatmak için aynı
+ * kısayol ya da ayarlardaki satır kullanılır (perdede düğme yok, çünkü perde boştur).
+ */
+final class KillSwitch {
+    static final String EXTRA = "com.golda.patchertiktok.KILL_SWITCH";
+    private static final String SHORTCUT_ID = "gktetok_kill";
+
+    /** Ekran adında bunlardan biri geçiyorsa özel (mesaj) ekran sayılır. */
+    private static final String[] PRIVATE_PARTS = {
+            "chat", "session", "inbox", "conversation", "instantmessag", "directmessage", "imessage",
+            "message", ".im.", "im.sdk",
+    };
+    /** Sohbet odası (tek kişiyle yazışma) ekranları → boş perde iner. */
+    private static final String[] ROOM_PARTS = {
+            "chatroom", "chat_room", "chatdetail", "chat.ui", ".chat.", "chatlistdetail",
+    };
+    /** Görünüm kimliğinde bunlardan biri geçiyorsa o yazı mesaj metnidir → silinir (kişi adları kalır). */
+    private static final String[] MASK_ID_PARTS = {
+            "content", "message", "msg", "preview", "bubble", "snippet", "last_msg",
+    };
+    /** Beğeni sayısını taşıyan JSON anahtarları. */
+    private static final String[] LIKE_KEYS = {"favoriting_count", "favoritingcount", "favoriting"};
+    private static final String USER_CLASS = "com.ss.android.ugc.aweme.profile.model.User";
+
+    /** Perde kendini yenilerken bu aralıkla kontrol eder (yalnızca açıkken çalışır). */
+    private static final long TICK_MS = 700L;
+    /** Bu ekranlara perde inmez: kendi ayar ekranımız. */
+    private static final String OWN_PACKAGE = "com.golda.patchertiktok";
+
+    private static volatile Handler handler;
+    private static volatile Application application;
+    private static volatile WeakReference<Activity> resumed = new WeakReference<>(null);
+    private static volatile View cover;
+    private static volatile int likesHooks;
+    private static volatile String loggedScreen = "";
+    private static volatile String coverScreen = "";
+    private static volatile int masked;
+
+    private KillSwitch() { }
+
+    // ---- kurulum ----------------------------------------------------------------------------
+
+    static void install(Application app, ClassLoader loader) {
+        application = app;
+        app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityResumed(Activity activity) {
+                resumed = new WeakReference<>(activity);
+                apply();
+            }
+
+            @Override public void onActivityPaused(Activity activity) {
+                hide();
+            }
+
+            @Override public void onActivityCreated(Activity activity, Bundle state) { }
+            @Override public void onActivityStarted(Activity activity) { }
+            @Override public void onActivityStopped(Activity activity) { }
+            @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) { }
+            @Override public void onActivityDestroyed(Activity activity) { }
+        });
+        installHostSwitcher();
+        hookFragments(loader);
+        installMask();
+        likesHooks = installLikesHooks(loader);
+        publishShortcut(app);
+        RuntimeLog.log("kill switch: installed, on=" + on() + ", likes hooks=" + likesHooks + ", mask=ready");
+        if (on()) {
+            toast(I18n.get(I18n.S.KS_TOAST_ON));
+            startTick();
+        }
+    }
+
+    /** Kısayol, TikTok'un ayar kapsayıcısını açar; biz onu sessiz bir aç/kapa ekranına çeviririz. */
+    private static void installHostSwitcher() {
+        Hooks.hookAll(Instrumentation.class, "newActivity", new Hooks.Hook() {
+            @Override protected void before(Hooks.Call param) {
+                if (param.args.length != 3 || !SettingsEntry.HOST_ACTIVITY.equals(param.args[1])) return;
+                if (!(param.args[2] instanceof Intent)) return;
+                Intent intent = (Intent) param.args[2];
+                if (!intent.getBooleanExtra(EXTRA, false)) return;
+                RuntimeLog.log("kill switch: shortcut fired");
+                if (param.getResult() != null) return;
+                param.setResult(new Toggle());
+            }
+        });
+    }
+
+    private static void hookFragments(ClassLoader loader) {
+        Class<?> fragment = Hooks.findClass("androidx.fragment.app.Fragment", loader);
+        if (fragment == null) return;
+        Hooks.findAndHook(fragment, "onResume", new Hooks.Hook() {
+            @Override protected void after(Hooks.Call param) {
+                // isVisible() bu çağrıdan hemen sonra güncellenir; kısa gecikmeyle bak.
+                Handler main = handler();
+                main.postDelayed(KillSwitch::apply, 120);
+            }
+        });
+    }
+
+    // ---- aç / kapa --------------------------------------------------------------------------
+
+    static boolean on() {
+        return Prefs.on(Prefs.KILL_SWITCH);
+    }
+
+    static int likesHooks() {
+        return likesHooks;
+    }
+
+    static void set(Context context, boolean enabled) {
+        Prefs.set(Prefs.KILL_SWITCH, enabled);
+        RuntimeLog.log("kill switch: " + (enabled ? "ON" : "OFF"));
+        if (enabled) {
+            startTick();
+            apply();
+        } else {
+            stopTick();
+            hide();
+        }
+        toast(I18n.get(enabled ? I18n.S.KS_TOAST_ON : I18n.S.KS_TOAST_OFF));
+    }
+
+    static void toggle(Context context) {
+        set(context, !on());
+    }
+
+    /** Kısayolun açtığı sessiz ekran: yalnızca anahtarı çevirir ve kapanır. */
+    public static final class Toggle extends Activity {
+        @Override protected void onCreate(Bundle saved) {
+            super.onCreate(saved);
+            try {
+                if (application != null) I18n.use(getResources().getConfiguration().getLocales().get(0));
+                KillSwitch.toggle(this);
+            } catch (Throwable error) {
+                RuntimeLog.log("kill switch toggle failed: " + error);
+            }
+            finish();
+        }
+    }
+
+    /** Kısayolu başlatıcıya ekler (varsa günceller). */
+    static boolean publishShortcut(Context context) {
+        if (Build.VERSION.SDK_INT < 25) return false;
+        try {
+            ShortcutManager manager = (ShortcutManager) context.getSystemService(Context.SHORTCUT_SERVICE);
+            if (manager == null) return false;
+            Intent intent = new Intent(Intent.ACTION_MAIN)
+                    .setClassName(context.getPackageName(), SettingsEntry.HOST_ACTIVITY)
+                    .putExtra(EXTRA, true)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            String label = I18n.get(I18n.S.KS_SHORTCUT_LABEL);
+            ShortcutInfo info = new ShortcutInfo.Builder(context, SHORTCUT_ID)
+                    .setShortLabel(label)
+                    .setLongLabel(label)
+                    .setIcon(shortcutIcon(context))
+                    .setIntent(intent)
+                    .setRank(0)
+                    .build();
+            manager.addDynamicShortcuts(Collections.singletonList(info));
+            RuntimeLog.log("kill switch: shortcut installed");
+            return true;
+        } catch (Throwable error) {
+            RuntimeLog.log("kill switch: shortcut failed: " + error);
+            return false;
+        }
+    }
+
+    private static Icon shortcutIcon(Context context) {
+        try {
+            ApplicationInfo info = context.getPackageManager().getApplicationInfo(context.getPackageName(), 0);
+            if (info.icon != 0) return Icon.createWithResource(context, info.icon);
+        } catch (Throwable ignored) { }
+        return Icon.createWithResource(context, android.R.drawable.sym_def_app_icon);
+    }
+
+    // ---- perde ------------------------------------------------------------------------------
+
+    private static void apply() {
+        try {
+            Activity activity = resumed.get();
+            if (!on() || activity == null || activity.isFinishing() || activity.isDestroyed()) {
+                hide();
+                return;
+            }
+            if (activity.getClass().getName().startsWith(OWN_PACKAGE)) {
+                hide();
+                return;
+            }
+            diagnose(activity);
+            // Sohbet odası → boş perde. Gelen kutusu → yalnız mesaj önizlemeleri silinir.
+            if (roomScreen(activity)) show(activity);
+            else hide();
+        } catch (Throwable error) {
+            RuntimeLog.log("kill switch cover failed: " + error);
+        }
+    }
+
+    /** Ekran bir sohbet odası mı? (etkinlik ya da görünür parça adına göre) */
+    private static boolean roomScreen(Activity activity) {
+        if (isRoom(activity.getClass().getName())) return true;
+        for (Object fragment : fragments(activity)) {
+            if (fragment == null || !visible(fragment)) continue;
+            if (isRoom(fragment.getClass().getName())) return true;
+        }
+        return false;
+    }
+
+    /** Saf kural: adında sohbet odası işareti var mı. */
+    static boolean isRoom(String className) {
+        if (className == null || className.startsWith(OWN_PACKAGE)) return false;
+        String lower = className.toLowerCase(Locale.ROOT);
+        for (String part : ROOM_PARTS) {
+            if (lower.contains(part)) return true;
+        }
+        return false;
+    }
+
+    /** Saf kural: görünüm kimliği mesaj metnini mi gösteriyor. */
+    static boolean maskId(String id) {
+        if (id == null || id.isEmpty()) return false;
+        String lower = id.toLowerCase(Locale.ROOT);
+        for (String part : MASK_ID_PARTS) {
+            if (lower.contains(part)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Mesaj metinlerini ekranda boşaltır; kişi adları ve diğer yazılar korunur.
+     * Yalnız mesaj ekranlarında ve yalnız sohbet odası DIŞINDA (orada perde var) çalışır.
+     */
+    private static void installMask() {
+        int hooks = 0;
+        for (java.lang.reflect.Method method : TextView.class.getDeclaredMethods()) {
+            if (!"setText".equals(method.getName())) continue;
+            Class<?>[] parameters = method.getParameterTypes();
+            if (parameters.length != 1 || parameters[0] != CharSequence.class) continue;
+            Hooks.hook(method, new Hooks.Hook() {
+                @Override protected void before(Hooks.Call param) {
+                    if (!on() || param.args.length == 0 || !(param.args[0] instanceof CharSequence)) return;
+                    if (((CharSequence) param.args[0]).length() == 0) return;
+                    Activity activity = resumed.get();
+                    if (activity == null || !privateScreen(activity) || roomScreen(activity)) return;
+                    if (!(param.thisObject instanceof TextView)) return;
+                    if (!maskId(viewId((TextView) param.thisObject))) return;
+                    param.args[0] = "";
+                    masked++;
+                }
+            });
+            hooks++;
+        }
+        RuntimeLog.log("kill switch: mask hooks=" + hooks);
+    }
+
+    /** Görünümün kaynak kimliği (yoksa üst katmanlara bakar). */
+    private static String viewId(TextView view) {
+        View current = view;
+        for (int depth = 0; depth < 4 && current != null; depth++) {
+            String id = idName(current);
+            if (!id.isEmpty()) return id;
+            current = current.getParent() instanceof View ? (View) current.getParent() : null;
+        }
+        return "";
+    }
+
+    private static String idName(View view) {
+        try {
+            int id = view.getId();
+            if (id == View.NO_ID) return "";
+            return view.getResources().getResourceEntryName(id);
+        } catch (Throwable error) {
+            return "";
+        }
+    }
+
+    /**
+     * Teşhis: Kill Switch açıkken her ekran için bir kez kaydedilir. Ekran adı, niyet (route),
+     * görünen parçalar ve görünüm kimliklerinden örnek içerir. Tanı raporunda görünür.
+     */
+    private static void diagnose(Activity activity) {
+        try {
+            String name = activity.getClass().getName();
+            if (name.equals(loggedScreen)) return;
+            loggedScreen = name;
+            StringBuilder out = new StringBuilder("kill switch: screen ").append(name);
+            Intent intent = activity.getIntent();
+            if (intent != null) {
+                out.append(" | action=").append(intent.getAction());
+                out.append(" | data=").append(intent.getDataString());
+                out.append(" | component=").append(intent.getComponent() == null ? "-" : intent.getComponent().getClassName());
+            }
+            List<Object> fragments = fragments(activity);
+            out.append(" | fragments=[");
+            for (int index = 0; index < fragments.size() && index < 4; index++) {
+                if (index > 0) out.append(',');
+                Object fragment = fragments.get(index);
+                out.append(fragment == null ? "-" : fragment.getClass().getSimpleName());
+            }
+            out.append("] | private=").append(privateScreen(activity)).append(" room=").append(roomScreen(activity));
+            List<String> ids = new ArrayList<>();
+            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+            collectIds(decor, ids, new int[]{250});
+            out.append(" | ids=").append(ids);
+            out.append(" | masked=").append(masked);
+            RuntimeLog.log(out.toString());
+        } catch (Throwable error) {
+            RuntimeLog.log("kill switch: diagnose failed: " + error.getClass().getSimpleName());
+        }
+    }
+
+    private static void collectIds(View view, List<String> out, int[] budget) {
+        if (view == null || budget[0] <= 0 || out.size() >= 12) return;
+        budget[0]--;
+        String id = idName(view);
+        if (!id.isEmpty() && !out.contains(id)) out.add(id);
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int index = 0; index < group.getChildCount(); index++) {
+                collectIds(group.getChildAt(index), out, budget);
+            }
+        }
+    }
+
+    private static void show(Activity activity) {
+        View current = cover;
+        if (current != null && current.getParent() == activity.getWindow().getDecorView()) return;
+        hide();
+        try {
+            FrameLayout blank = new FrameLayout(activity);
+            blank.setBackgroundColor(blankColor(activity));
+            blank.setClickable(false);
+            blank.setFocusable(false);
+            View decor = activity.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup)) return;
+            ((ViewGroup) decor).addView(blank,
+                    new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT));
+            cover = blank;
+            if (!activity.getClass().getName().equals(coverScreen)) {
+                coverScreen = activity.getClass().getName();
+                RuntimeLog.log("kill switch: cover ON " + activity.getClass().getSimpleName());
+            }
+        } catch (Throwable error) {
+            RuntimeLog.log("kill switch cover failed: " + error);
+        }
+    }
+
+    private static void hide() {
+        View current = cover;
+        cover = null;
+        if (current != null) {
+            coverScreen = "";
+            RuntimeLog.log("kill switch: cover OFF");
+        }
+        if (current == null) return;
+        try {
+            ViewGroup parent = (ViewGroup) current.getParent();
+            if (parent != null) parent.removeView(current);
+        } catch (Throwable ignored) { }
+    }
+
+    /** Boş perdenin rengi: gece koyu, gündüz açık (tamamen boş ekran). */
+    static int blankColor(Activity activity) {
+        int mode = activity.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        boolean night = mode == Configuration.UI_MODE_NIGHT_YES
+                || Prefs.on(Prefs.AMOLED) || Prefs.on(Prefs.SOFT_BLACK) || Night.activeNow();
+        return night ? 0xFF000000 : 0xFFFFFFFF;
+    }
+
+    /** Şu anki ekran mesaj ekranı mı? (DM filtresi bunu kullanır) */
+    static boolean privateNow() {
+        try {
+            Activity activity = resumed.get();
+            return activity != null && privateScreen(activity);
+        } catch (Throwable error) {
+            return false;
+        }
+    }
+
+    /** Ekranda özel (mesaj) bölüm var mı: önce etkinliğin kendisi, sonra görünür parçaları. */
+    private static boolean privateScreen(Activity activity) {
+        if (isPrivateScreen(activity.getClass().getName())) return true;
+        for (Object fragment : fragments(activity)) {
+            if (fragment == null || !visible(fragment)) continue;
+            if (isPrivateScreen(fragment.getClass().getName())) return true;
+        }
+        return false;
+    }
+
+    /** Saf kural (bkz. KillSwitchTest): adında mesaj bölümü geçen sınıflar özel sayılır. */
+    static boolean isPrivateScreen(String className) {
+        if (className == null || className.startsWith(OWN_PACKAGE)) return false;
+        String lower = className.toLowerCase(Locale.ROOT);
+        for (String part : PRIVATE_PARTS) {
+            if (lower.contains(part)) return true;
+        }
+        return false;
+    }
+
+    /** Saf kural: bu JSON anahtarı beğeni sayısını taşır mı. */
+    static boolean isLikeKey(String key) {
+        if (key == null) return false;
+        String lower = key.toLowerCase(Locale.ROOT);
+        for (String candidate : LIKE_KEYS) {
+            if (lower.equals(candidate)) return true;
+        }
+        return false;
+    }
+
+    private static List<Object> fragments(Activity activity) {
+        List<Object> list = new ArrayList<>();
+        try {
+            Object manager = null;
+            try {
+                manager = activity.getClass().getMethod("getSupportFragmentManager").invoke(activity);
+            } catch (Throwable ignored) {
+                manager = activity.getClass().getMethod("getFragmentManager").invoke(activity);
+            }
+            Method get = manager.getClass().getMethod("getFragments");
+            Object result = get.invoke(manager);
+            if (result instanceof List<?>) {
+                for (Object fragment : (List<?>) result) list.add(fragment);
+            }
+        } catch (Throwable ignored) { }
+        return list;
+    }
+
+    private static boolean visible(Object fragment) {
+        try {
+            Method isVisible = fragment.getClass().getMethod("isVisible");
+            Object value = isVisible.invoke(fragment);
+            if (value instanceof Boolean) return (Boolean) value;
+        } catch (Throwable ignored) { }
+        return true;
+    }
+
+    // ---- beğeni sayısı ----------------------------------------------------------------------
+
+    /**
+     * Beğeni sayacını 0'a çeken kancalar. Obfuscated sürümlerde alan adı değişebilir; bu yüzden
+     * önce Gson/Kotlin alan adlarına (@SerializedName değeri "favoriting_count") bakılır, sonra
+     * adında "favorit" geçen int/long döndüren metotlar kancalanır. Kaç kanca kurulduğu döner.
+     */
+    private static int installLikesHooks(ClassLoader loader) {
+        int count = 0;
+        List<String> classes = new ArrayList<>(Discovery.classesUsing(LIKE_KEYS[0]));
+        classes.add(USER_CLASS);
+        for (String name : classes) {
+            Class<?> type = Hooks.findClass(name, loader);
+            if (type == null) continue;
+            for (Field field : type.getDeclaredFields()) {
+                String getterName = likeGetterName(field);
+                if (getterName == null) continue;
+                count += hookCountGetters(type, getterName);
+            }
+            count += hookCountGetters(type, "getFavoritingCount");
+        }
+        return count;
+    }
+
+    private static String likeGetterName(Field field) {
+        boolean likes = isLikeKey(field.getName());
+        for (Annotation annotation : field.getAnnotations()) {
+            for (Method member : annotation.annotationType().getDeclaredMethods()) {
+                if (member.getParameterTypes().length != 0) continue;
+                try {
+                    Object value = member.invoke(annotation);
+                    if (value instanceof String && isLikeKey((String) value)) likes = true;
+                } catch (Throwable ignored) { }
+            }
+        }
+        if (!likes) return null;
+        String fieldName = field.getName();
+        if (fieldName.length() > 1) {
+            return "get" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+        }
+        return fieldName;
+    }
+
+    /** Bu adda 0 parametreli int/long metotları 0 döndürecek şekilde kancalar. */
+    private static int hookCountGetters(Class<?> type, String methodName) {
+        int hooks = 0;
+        for (Method method : type.getDeclaredMethods()) {
+            if (!method.getName().equals(methodName)) continue;
+            if (method.getParameterTypes().length != 0) continue;
+            Class<?> ret = method.getReturnType();
+            if (ret != int.class && ret != long.class) continue;
+            if (isHooked(method)) continue;
+            Hooks.hook(method, new Hooks.Hook() {
+                @Override protected void before(Hooks.Call param) {
+                    if (!on()) return;
+                    param.setResult(ret == long.class ? Long.valueOf(0L) : Integer.valueOf(0));
+                }
+            });
+            hooks++;
+        }
+        return hooks;
+    }
+
+    private static final List<String> HOOKED = new ArrayList<>();
+
+    private static boolean isHooked(Method method) {
+        String id = method.getDeclaringClass().getName() + "#" + method.getName();
+        if (HOOKED.contains(id)) return true;
+        HOOKED.add(id);
+        return false;
+    }
+
+    // ---- zamanlayıcı ------------------------------------------------------------------------
+
+    private static synchronized Handler handler() {
+        Handler current = handler;
+        if (current == null) {
+            current = new Handler(Looper.getMainLooper());
+            handler = current;
+        }
+        return current;
+    }
+
+    private static final Runnable TICK = new Runnable() {
+        @Override public void run() {
+            apply();
+            Handler main = handler;
+            if (main != null && on()) main.postDelayed(this, TICK_MS);
+        }
+    };
+
+    private static void startTick() {
+        Handler main = handler();
+        main.removeCallbacks(TICK);
+        main.postDelayed(TICK, TICK_MS);
+    }
+
+    private static void stopTick() {
+        Handler main = handler;
+        if (main != null) main.removeCallbacks(TICK);
+    }
+
+    private static void toast(String text) {
+        final Context context = application;
+        if (context == null || text == null || text.isEmpty()) return;
+        handler().post(() -> {
+            try {
+                Toast.makeText(context, text, Toast.LENGTH_SHORT).show();
+            } catch (Throwable ignored) { }
+        });
+    }
+}
